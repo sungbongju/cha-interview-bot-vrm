@@ -223,14 +223,21 @@ const VRMAvatar = forwardRef(function VRMAvatar(
           headNode.getWorldPosition(p)
           headY = p.y
         }
-        camera.position.set(0, headY - 0.02, 0.78)
-        camera.lookAt(0, headY - 0.06, 0)
+        camera.position.set(0, headY - 0.04, 1.0)
+        camera.lookAt(0, headY - 0.08, 0)
 
         // 미세 호흡용 — chest(없으면 spine)의 rest 회전 보관
         const chest =
           vrm.humanoid?.getNormalizedBoneNode?.('chest') ||
           vrm.humanoid?.getNormalizedBoneNode?.('spine')
         const chestRestX = chest ? chest.rotation.x : 0
+
+        // VRoid VRM 은 A-pose(팔 벌림)로 익스포트된다 → 윗팔을 안쪽으로 내려
+        // 자연스러운 차렷 자세로 보정 (값은 화면 보고 튜닝).
+        const lUpperArm = vrm.humanoid?.getNormalizedBoneNode?.('leftUpperArm')
+        const rUpperArm = vrm.humanoid?.getNormalizedBoneNode?.('rightUpperArm')
+        if (lUpperArm) lUpperArm.rotation.z -= 1.5
+        if (rUpperArm) rUpperArm.rotation.z += 1.5
 
         readyRef.current = true
         onReady?.(vrm)
@@ -270,10 +277,17 @@ const VRMAvatar = forwardRef(function VRMAvatar(
 
           const em = v.expressionManager
           if (em) {
-            // 1) 감정 표정 — 매 프레임 리셋 후 override 적용
+            // 1) 감정 표정 — 매 프레임 리셋 후, override 가 있으면 그걸,
+            //    없으면 따뜻한 기본 표정(말할 땐 더 생기있게 + 느린 드리프트).
             for (const name of EMOTION_NAMES) em.setValue(name, 0)
             const ov = expressionOverrideRef.current
-            if (ov) em.setValue(ov.name, ov.value)
+            if (ov) {
+              em.setValue(ov.name, ov.value)
+            } else {
+              const warmBase = speakingRef.current ? 0.34 : 0.18
+              const drift = 0.05 + 0.05 * Math.sin(t * 0.5)
+              em.setValue('happy', warmBase + drift)
+            }
 
             // 2) 립싱크 — 보간된 입 벌림을 'aa' viseme 에 적용
             em.setValue('aa', mouthSmoothed)
