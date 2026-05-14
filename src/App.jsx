@@ -7,9 +7,9 @@ import styles from './App.module.css'
 import { getUser, clearAuth, verifyToken, newSessionId, saveChat } from './lib/api'
 import { MicRecorder, isMicRecorderSupported } from './lib/stt'
 
-// LiveAvatar (HeyGen 후속, LiveKit 기반 WebRTC). avatar_id는 박대근 교수님 워크스페이스의 LiveAvatar UUID.
-const AVATAR_ID = '3554efce-af84-4701-981e-2cbd46e991af'
-const INTERACTIVITY_TYPE = 'CONVERSATIONAL'
+// 아바타: VRoid VRM (이경영) — 브라우저에서 three-vrm 으로 직접 렌더 + 립싱크.
+// 기존 LiveAvatar(HeyGen 후속, LiveKit 기반 SaaS) 를 대체. TTS 는 middleton
+// OmniVoice 서버(/api/tts)를 쓴다 — 렌더링·TTS 모두 자체 인프라라 제로 코스트.
 
 // 봇 발화 종료 후 마이크 재개까지의 지연 (스피커 잔향이 마이크로 다시 잡히는 echo 회피)
 const ECHO_RESUME_DELAY_MS = 700
@@ -108,62 +108,11 @@ function normalizeTtsText(text) {
     .trim()
 }
 
-// LiveAvatar DataChannel 커맨드 — heygen-com/liveavatar-web-sdk 공식 spec
-// 핵심: 모든 command에 event_id (UUID) 필수. 누락 시 agent가 invalid event로 drop함.
-function generateEventId() {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const r = (Math.random() * 16) | 0
-    const v = c === 'x' ? r : (r & 0x3) | 0x8
-    return v.toString(16)
-  })
-}
-
-function sendAvatarCommand(room, eventType, data) {
-  if (!room || !room.localParticipant) {
-    console.warn('[LA] sendAvatarCommand skipped: no room/localParticipant', { eventType, hasRoom: !!room })
-    return
-  }
-  const cmd = Object.assign(
-    { event_id: generateEventId(), event_type: eventType },
-    data || {}
-  )
-  const encoded = new TextEncoder().encode(JSON.stringify(cmd))
-  try {
-    room.localParticipant.publishData(encoded, { reliable: true, topic: 'agent-control' })
-    console.log('[LA] sendAvatarCommand:', eventType, 'event_id:', cmd.event_id.slice(0, 8))
-  } catch (e) {
-    console.error('[LA] publishData error:', e)
-  }
-}
-
-async function stopLiveAvatarSession(sessionId) {
-  if (!sessionId) return
-  try {
-    await fetch('/api/liveavatar-session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'stop', session_id: sessionId, reason: 'USER_CLOSED' })
-    })
-  } catch (e) { console.warn('[LA] stop 실패:', e) }
-}
-
-async function keepAliveLiveAvatar(sessionId) {
-  if (!sessionId) return
-  try {
-    await fetch('/api/liveavatar-session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'keep-alive', session_id: sessionId })
-    })
-  } catch (e) { console.warn('[LA] keep-alive 실패:', e) }
-}
-
 export default function App() {
   const [status, setStatus]             = useState('idle')   // idle | connecting | connected | speaking
   const [messages, setMessages]         = useState([])
   const [isProcessing, setIsProcessing] = useState(false)
-  const [videoReady, setVideoReady]     = useState(false)
+  const [videoReady, setVideoReady]     = useState(false)    // VRM 로드 완료 여부
   const [isListening, setIsListening]   = useState(false)
   const [autoListen, setAutoListen]     = useState(false)
   const [user, setUser]                 = useState(getUser())     // 로그인된 사용자 (없으면 null = 익명)
@@ -192,17 +141,12 @@ export default function App() {
   const lastEndedSessionIdRef = useRef(null) // 종료 직후 헤더 "설문" 버튼이 마지막 세션을 참조하도록 보존
   const lastEndedModesRef = useRef([])
 
-  const roomRef           = useRef(null)
-  const sessionRef        = useRef(null)
-  const videoRef          = useRef(null)
-  const audioRef          = useRef(null)
+  const vrmAvatarRef      = useRef(null)   // <VRMAvatar> imperative handle (speak/stopSpeaking/...)
+  const sessionRef        = useRef(null)   // 아바타 세션 활성 플래그 (ftf/sts true, idle/ttt null)
   const userVideoRef      = useRef(null)
-  const avatarVideoTrackRef = useRef(null)
-  const avatarAudioTrackRef = useRef(null)
   const cameraStreamRef   = useRef(null)
   const historyRef        = useRef([])
   const sessionIdRef      = useRef(null)   // 학교 DB용 세션 ID (아바타 시작 시 새로)
-  const keepAliveIntervalRef = useRef(null) // LiveAvatar keep-alive setInterval id
   const conversationModeRef = useRef('ftf')
 
   // 토큰 검증 — 성공하면 모달 닫음 / 실패하면 모달 유지 (이미 열려있음)
@@ -219,6 +163,10 @@ export default function App() {
     clearAuth()
     setUser(null)
   }
+
+  const handleAvatarReady = useCallback(() => {
+    setVideoReady(true)
+  }, [])
 
   // ─── STT (middleton whisper 기반 MicRecorder) ────────────────────────
   // 기존 Web Speech API(webkitSpeechRecognition)는 iOS Safari / 카카오 in-app
@@ -294,6 +242,35 @@ export default function App() {
 
   useEffect(() => () => stopUserCamera(), [stopUserCamera])
 
+  // ─── TTS 발화 (LLM 답변 텍스트 → middleton OmniVoice → VRM 립싱크) ──────
+  // 기존 LiveAvatar 의 sendAvatarCommand('avatar.speak_text') 를 대체한다.
+  // fire-and-forget: status 를 내부에서 speaking↔connected 로 관리한다.
+  const speakViaTTS = useCallback(async (text) => {
+    const t = (text || '').trim()
+    if (!t) return
+    const avatar = vrmAvatarRef.current
+    try {
+      isSpeakingRef.current = true
+      setStatus('speaking')
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: t }),
+      })
+      if (!res.ok) throw new Error('tts ' + res.status)
+      const buf = await res.arrayBuffer()
+      if (avatar && avatar.speak) {
+        await avatar.speak(buf)   // 오디오 재생 + 립싱크, 끝나면(또는 인터럽트 시) resolve
+      }
+    } catch (e) {
+      console.warn('[tts] speak 실패:', e)
+    } finally {
+      isSpeakingRef.current = false
+      // 인터럽트로 이미 connected 로 바뀌었을 수 있으니 speaking 일 때만 되돌린다
+      setStatus(s => (s === 'speaking' ? 'connected' : s))
+    }
+  }, [])
+
   // ─── 메시지 전송 ───────────────────────────────────
   const sendMessage = useCallback(async (userText) => {
     const text = userText.trim()
@@ -337,11 +314,9 @@ export default function App() {
       // DB 저장 (어시스턴트 답변)
       if (sessionIdRef.current) saveChat(sessionIdRef.current, 'assistant', reply)
 
-      // LiveAvatar 발화 — DataChannel 'avatar.speak_text' 커맨드
-      if (sessionRef.current && roomRef.current && conversationModeRef.current !== 'ttt') {
-        isSpeakingRef.current = true
-        setStatus('speaking')
-        sendAvatarCommand(roomRef.current, 'avatar.speak_text', { text: ttsReply })
+      // 아바타 발화 — TTS → VRM 립싱크 (ttt 모드 제외). fire-and-forget.
+      if (conversationModeRef.current !== 'ttt') {
+        speakViaTTS(ttsReply)
       }
     } catch {
       setMessages(prev => {
@@ -353,7 +328,7 @@ export default function App() {
       isProcessingRef.current = false
       setIsProcessing(false)
     }
-  }, [captureCameraFrame])
+  }, [captureCameraFrame, speakViaTTS])
 
   // ─── STT 텍스트 제출 (whisper 결과 → sendMessage) ────────────────────
   const submitSpeechText = useCallback((rawText) => {
@@ -431,15 +406,13 @@ export default function App() {
     setIsListening(false)
   }, [])
 
-  // ─── LiveAvatar interrupt ────────────────────────
+  // ─── 아바타 발화 인터럽트 ────────────────────────
   const interruptAvatar = useCallback(() => {
     // 봇 발화만 멈춤. 마이크(MicRecorder)는 그대로 유지 — status가 'connected'로
     // 바뀌면 아래 echo guard useEffect가 알아서 resume 한다.
-    if (sessionRef.current && roomRef.current) {
-      try {
-        sendAvatarCommand(roomRef.current, 'avatar.interrupt')
-      } catch (e) { console.error('interrupt error:', e) }
-    }
+    try {
+      vrmAvatarRef.current?.stopSpeaking?.()
+    } catch (e) { console.error('interrupt error:', e) }
     isSpeakingRef.current = false
     setStatus('connected')
   }, [])
@@ -525,22 +498,8 @@ export default function App() {
     stopUserCamera()
     isSpeakingRef.current = false
 
-    // LiveAvatar keep-alive 타이머 정지
-    if (keepAliveIntervalRef.current) {
-      clearInterval(keepAliveIntervalRef.current)
-      keepAliveIntervalRef.current = null
-    }
-
-    // LiveAvatar 세션 종료 (best-effort)
-    if (sessionRef.current) {
-      await stopLiveAvatarSession(sessionRef.current.session_id)
-    }
-
-    // LiveKit 연결 끊기
-    if (roomRef.current) {
-      try { await roomRef.current.disconnect() } catch {}
-      roomRef.current = null
-    }
+    // 진행 중인 TTS 발화 중단
+    try { vrmAvatarRef.current?.stopSpeaking?.() } catch {}
 
     // 설문 트리거 — 사용자 턴 3회 이상일 때만 노출
     const endedSessionId = sessionIdRef.current
@@ -550,10 +509,7 @@ export default function App() {
     // 상태 리셋
     sessionRef.current     = null
     sessionIdRef.current   = null
-    avatarVideoTrackRef.current = null
-    avatarAudioTrackRef.current = null
     historyRef.current     = []
-    setVideoReady(false)
     setStatus('idle')
     setMessages([])           // 채팅 초기화 — 깔끔하게 다시 시작
 
@@ -583,7 +539,6 @@ export default function App() {
     sessionRef.current = null
     sessionIdRef.current = newSessionId()
     historyRef.current = []
-    setVideoReady(false)
     setStatus('connected')
 
     const greetingText = getGreetingText(user)
@@ -591,176 +546,41 @@ export default function App() {
     saveChat(sessionIdRef.current, 'assistant', greetingText)
   }, [stopListening, stopUserCamera, user])
 
-  // ─── 아바타 시작 ───────────────────────────────────
-  const attachAvatarTracks = useCallback(() => {
-    if (avatarVideoTrackRef.current && videoRef.current) {
-      try {
-        avatarVideoTrackRef.current.attach(videoRef.current)
-        setVideoReady(true)
-      } catch (e) { console.warn('video attach error:', e) }
-    }
-    if (avatarAudioTrackRef.current && audioRef.current) {
-      try {
-        avatarAudioTrackRef.current.attach(audioRef.current)
-        audioRef.current.play?.().catch(() => {})
-      } catch (e) { console.warn('audio attach error:', e) }
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!sessionRef.current || conversationMode === 'ttt') return
-
-    let rafId = 0
-    const timerIds = []
-    const reattach = () => attachAvatarTracks()
-
-    rafId = window.requestAnimationFrame(reattach)
-    timerIds.push(window.setTimeout(reattach, 120))
-    timerIds.push(window.setTimeout(reattach, 360))
-
-    return () => {
-      window.cancelAnimationFrame(rafId)
-      timerIds.forEach(window.clearTimeout)
-    }
-  }, [attachAvatarTracks, conversationMode])
-
+  // ─── 아바타 시작 (VRM) ─────────────────────────────
+  // VRM 은 AvatarPanel 에 항상 마운트돼 앱 로드 시점부터 자체 로딩된다.
+  // 여기서는 카메라/세션/인사말만 처리하고, VRM 로드가 안 끝났으면 잠깐 기다린다.
   const startAvatar = useCallback(async () => {
     setStatus('connecting')
-    sessionIdRef.current = newSessionId()  // 새 세션 ID
+    sessionIdRef.current = newSessionId()
     lastSubmittedSpeechRef.current = { key: '', at: 0 }
     if (conversationModeRef.current === 'ftf') {
       await startUserCamera()
     } else {
       stopUserCamera()
     }
-    try {
-      // LiveAvatar: token + start 통합 단일 엔드포인트
-      const sess = await fetch('/api/liveavatar-token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          avatar_id: AVATAR_ID,
-          interactivity_type: INTERACTIVITY_TYPE
-        })
-      }).then(r => r.json())
-      if (!sess.livekit_url || !sess.livekit_client_token) {
-        throw new Error('LiveAvatar 세션 생성 실패: ' + JSON.stringify(sess))
-      }
-      sessionRef.current = sess  // { session_id, session_token, livekit_url, livekit_client_token }
 
-      const room = new window.LivekitClient.Room({
-        adaptiveStream: true,
-        dynacast: true,
-        audioCaptureDefaults: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      })
-      roomRef.current = room
-
-      room.on(window.LivekitClient.RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
-        try {
-          const text = new TextDecoder().decode(payload)
-          const evt = JSON.parse(text)
-          const type = evt.event_type || evt.type || ''
-          console.log('[LA] DataReceived topic=' + topic + ' type=' + type, evt)
-          if (topic && topic !== 'agent-response') return
-          if (type === 'avatar.speak_started') {
-            isSpeakingRef.current = true
-            setStatus('speaking')
-          }
-          if (type === 'avatar.speak_ended') {
-            isSpeakingRef.current = false
-            setStatus('connected')
-          }
-          if (type === 'session.stopped') console.log('[LA] session stopped by server')
-        } catch (e) {
-          console.warn('[LA] DataReceived parse error:', e)
-        }
-      })
-
-      room.on(window.LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
-        console.log('[LA] TrackSubscribed:', track.kind, 'from', participant?.identity)
-        if (track.kind === 'video') {
-          avatarVideoTrackRef.current = track
-          if (videoRef.current) {
-            track.attach(videoRef.current)
-            setVideoReady(true)
-            console.log('[LA] video track attached')
-          } else {
-            console.warn('[LA] videoRef.current is null at TrackSubscribed')
-          }
-        }
-        if (track.kind === 'audio') {
-          avatarAudioTrackRef.current = track
-          // v11/공식 SDK 패턴: 트랙마다 별도 audio element 생성 + body append.
-          const audioEl = track.attach()
-          audioEl.autoplay = true
-          audioEl.dataset.laTrack = participant?.identity || 'unknown'
-          audioEl.style.display = 'none'
-          document.body.appendChild(audioEl)
-          audioEl.play?.().catch(err => console.warn('[LA] audio play() blocked:', err))
-          console.log('[LA] audio track attached (separate element) from', participant?.identity)
-        }
-      })
-
-      room.on(window.LivekitClient.RoomEvent.Disconnected, (reason) => {
-        console.warn('[LA] Disconnected, reason:', reason)
-        isSpeakingRef.current = false
-        setStatus('connected')
-      })
-
-      room.on(window.LivekitClient.RoomEvent.ConnectionStateChanged, (state) => {
-        console.log('[LA] ConnectionState:', state)
-      })
-
-      console.log('[LA] connecting to', sess.livekit_url, 'session:', sess.session_id)
-      await room.connect(sess.livekit_url, sess.livekit_client_token)
-      console.log('[LA] room.connect OK, state:', room.state)
-
-      // 세션 유지 — LiveAvatar 세션은 일정 시간 유휴 시 자동 종료되므로 주기적 keep-alive
-      keepAliveIntervalRef.current = setInterval(() => {
-        keepAliveLiveAvatar(sess.session_id)
-      }, 60_000)
-
-      setStatus('connected')
-
-      // 인사말 — 채팅 표시 + 아바타 발화
-      const greetingText = getGreetingText(user)
-      const greetingTts = normalizeTtsText(getGreetingTts(user))
-
-      setMessages([{ role: 'assistant', text: greetingText }])
-      saveChat(sessionIdRef.current, 'assistant', greetingText)
-
-      // 인사말 발화 (트랙 attach 직후 첫 명령 누락 방지 위해 800ms 지연)
-      isSpeakingRef.current = true
-      setStatus('speaking')
-      setTimeout(() => {
-        try {
-          sendAvatarCommand(roomRef.current, 'avatar.speak_text', { text: greetingTts })
-        } catch (e) { console.error('greeting speak error:', e) }
-      }, 800)
-
-      // 마이크 자동 시작 (사용자 클릭(시작 버튼) 컨텍스트 안이라 권한 prompt 가능)
-      // MicRecorder는 인사말 발화 중엔 echo guard로 pause → 발화 끝나면 자동 resume
-      autoListenRef.current = true
-      setAutoListen(true)
-      startListening()
-    } catch (e) {
-      console.error(e)
-      stopUserCamera()
-      if (roomRef.current) {
-        try { await roomRef.current.disconnect() } catch {}
-        roomRef.current = null
-      }
-      sessionRef.current = null
-      avatarVideoTrackRef.current = null
-      avatarAudioTrackRef.current = null
-      setVideoReady(false)
-      setStatus('idle')
+    // VRM 로드 대기 (보통 이미 로드 완료 — 최대 5초)
+    for (let i = 0; i < 50 && !vrmAvatarRef.current?.isReady?.(); i++) {
+      await new Promise(r => setTimeout(r, 100))
     }
-  }, [startListening, startUserCamera, stopUserCamera, user])
+
+    sessionRef.current = true   // 아바타 세션 활성
+    historyRef.current = []
+    setStatus('connected')
+
+    // 인사말 — 채팅 표시 + TTS 발화
+    const greetingText = getGreetingText(user)
+    const greetingTts = normalizeTtsText(getGreetingTts(user))
+    setMessages([{ role: 'assistant', text: greetingText }])
+    saveChat(sessionIdRef.current, 'assistant', greetingText)
+    speakViaTTS(greetingTts)   // fire-and-forget — status 를 speaking↔connected 로 관리
+
+    // 마이크 자동 시작 (사용자 클릭(시작 버튼) 컨텍스트 안이라 권한 prompt 가능)
+    // MicRecorder는 인사말 발화 중엔 echo guard로 pause → 발화 끝나면 자동 resume
+    autoListenRef.current = true
+    setAutoListen(true)
+    startListening()
+  }, [startListening, startUserCamera, stopUserCamera, user, speakViaTTS])
 
   const startConversation = useCallback(() => {
     if (conversationModeRef.current === 'ttt') {
@@ -821,8 +641,8 @@ export default function App() {
         status={status}
         mode={conversationMode}
         onModeChange={changeConversationMode}
-        videoRef={videoRef}
-        audioRef={audioRef}
+        vrmAvatarRef={vrmAvatarRef}
+        onAvatarReady={handleAvatarReady}
         userVideoRef={userVideoRef}
         videoReady={videoReady}
         cameraActive={Boolean(cameraStream)}

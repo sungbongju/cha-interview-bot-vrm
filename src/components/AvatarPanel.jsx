@@ -1,4 +1,5 @@
 import styles from './AvatarPanel.module.css'
+import VRMAvatar from './VRMAvatar'
 
 const STATUS_MAP = {
   idle:       { label: '대기 중',   dot: 'gray'  },
@@ -17,8 +18,8 @@ export default function AvatarPanel({
   status,
   mode,
   onModeChange,
-  videoRef,
-  audioRef,
+  vrmAvatarRef,
+  onAvatarReady,
   userVideoRef,
   videoReady,
   cameraActive,
@@ -44,53 +45,40 @@ export default function AvatarPanel({
   return (
     <div className={styles.panel}>
       <div className={stageClass}>
-        <audio
-          ref={audioRef}
-          autoPlay
-          playsInline
-          className={styles.hiddenMedia}
-        />
-
-        {!showAvatarVideo && (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            className={styles.hiddenMedia}
+        {/* VRM 아바타 — 항상 마운트(speak() 오디오가 ftf/sts 모두에서 동작).
+            ftf 모드에서만 시각적으로 표시, sts/ttt 에선 display:none 으로 숨긴다. */}
+        <div
+          className={styles.videoWrap}
+          style={showAvatarVideo ? undefined : { display: 'none' }}
+        >
+          <VRMAvatar
+            ref={vrmAvatarRef}
+            vrmUrl="/avatar.vrm"
+            onReady={onAvatarReady}
+            style={{ opacity: videoReady ? 1 : 0, transition: 'opacity .35s ease' }}
           />
-        )}
 
-        {showAvatarVideo && (
-          <div className={styles.videoWrap}>
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              className={styles.video}
-              style={{ opacity: videoReady ? 1 : 0 }}
-            />
-            {!videoReady && (
-              <div className={styles.placeholder}>
-                <div className={styles.avatarIcon}>
-                  <span>AI</span>
-                </div>
-                <p className={styles.placeholderText}>AI 면담 어시스턴트</p>
-                <p className={styles.placeholderSub}>차의과학대학교 신입생 전공상담</p>
+          {!videoReady && (
+            <div className={styles.placeholder}>
+              <div className={styles.avatarIcon}>
+                <span>AI</span>
               </div>
-            )}
+              <p className={styles.placeholderText}>AI 면담 어시스턴트</p>
+              <p className={styles.placeholderSub}>차의과학대학교 신입생 전공상담</p>
+            </div>
+          )}
 
-            {videoReady && (
-              <div className={styles.nameplate}>
-                <div className={styles.nameplateInner}>
-                  <span className={styles.nameplateName}>AI 면담 어시스턴트</span>
-                  <span className={styles.nameplateSub}>차의과학대학교 신입생 전공상담</span>
-                </div>
+          {videoReady && (
+            <div className={styles.nameplate}>
+              <div className={styles.nameplateInner}>
+                <span className={styles.nameplateName}>AI 면담 어시스턴트</span>
+                <span className={styles.nameplateSub}>차의과학대학교 신입생 전공상담</span>
               </div>
-            )}
+            </div>
+          )}
 
-            {status === 'speaking' && <div className={styles.speakGlow} />}
-          </div>
-        )}
+          {status === 'speaking' && <div className={styles.speakGlow} />}
+        </div>
 
         {showVoiceOnly && (
           <div className={`${styles.voicePanel} ${status === 'speaking' ? styles.voiceSpeaking : ''}`}>

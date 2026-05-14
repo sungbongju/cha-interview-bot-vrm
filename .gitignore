@@ -141,3 +141,4 @@ rag/index_private/
 *.zip
 *.tar.gz
 *.tgz
+.vercel
