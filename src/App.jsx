@@ -365,17 +365,34 @@ export default function App() {
     let accumulated = ''       // 전체 누적 텍스트 (화면 표시용)
     let pending = ''           // 아직 TTS 큐에 안 넣은 부분
     let contactObj = null
-    // 문장 경계: 마침표/물음표/느낌표/줄바꿈 또는 ", "(쉼표+공백) — 최소 길이 보장
-    const MIN_SENT_LEN = 10
+    let isFirstFlush = true    // 첫 chunk 만 짧게 trigger (첫 audio latency 최소화)
 
+    // 문장 경계 처리.
+    // - 첫 chunk: 길이 6+ 의 짧은 phrase 도 OK, 콤마/한국식 쉼표도 boundary
+    // - 두 번째부터: 길이 12+ 의 마침표/물음표/느낌표만 (자연스러운 intonation)
     const flushPendingIfSentence = () => {
-      // ',' 는 보너스 끊김 포인트 — 너무 짧으면 무시
-      const m = pending.match(/^([\s\S]*?[.!?…。\n])(.*)$/)
-      if (m && m[1].trim().length >= MIN_SENT_LEN) {
+      const minLen = isFirstFlush ? 6 : 12
+
+      // 1) 강한 boundary — 마침표/물음표/느낌표/줄바꿈
+      let m = pending.match(/^([\s\S]*?[.!?…。\n])(.*)$/)
+      if (m && m[1].trim().length >= minLen) {
         enqueueTTS(m[1])
         pending = m[2]
+        isFirstFlush = false
         return true
       }
+
+      // 2) 약한 boundary — 콤마류 (첫 chunk 한정)
+      if (isFirstFlush) {
+        m = pending.match(/^([\s\S]*?[,，、])(.*)$/)
+        if (m && m[1].trim().length >= 6) {
+          enqueueTTS(m[1])
+          pending = m[2]
+          isFirstFlush = false
+          return true
+        }
+      }
+
       return false
     }
 
